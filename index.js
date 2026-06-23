@@ -113,7 +113,7 @@ app.post('/instance/send-otp', async (req, res) => {
 // 4. Servidor en escucha y auto-restauración
 // 4. Servidor en escucha y auto-restauración
 // CAMBIO PRODUCTIVO: Usa el puerto del entorno o el 3000 por defecto
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, '0.0.0.0', () => { 
     // Nota: Añadir '0.0.0.0' expone el servidor a la red externa en entornos Linux/Docker
@@ -126,6 +126,44 @@ app.listen(PORT, '0.0.0.0', () => {
                 console.log(`Restaurando sesión guardada de: ${file}`);
                 initInstance(file);
             }
+        });
+    }
+});
+
+
+// 3.5 Enviar Mensaje Genérico (Notificaciones de flujos, alertas, etc.)
+app.post('/instance/send-message', async (req, res) => {
+    const { instanceId, phone, message } = req.body;
+
+    // Validación de parámetros esenciales
+    if (!instanceId || !phone || !message) {
+        return res.status(400).json({ 
+            error: 'Faltan parámetros obligatorios: instanceId, phone o message' 
+        });
+    }
+
+    const instance = instances.get(instanceId);
+    if (!instance || instance.status !== 'CONNECTED') {
+        return res.status(400).json({ 
+            error: `La instancia [${instanceId}] no está conectada o lista.` 
+        });
+    }
+
+    try {
+        // Aseguramos el formato del JID de WhatsApp
+        const jid = `${phone.trim()}@s.whatsapp.net`;
+
+        // Enviamos el texto crudo enviado desde tu backend
+        await instance.sock.sendMessage(jid, { text: message });
+        
+        return res.status(200).json({ 
+            success: true, 
+            message: 'Mensaje de flujo enviado con éxito' 
+        });
+    } catch (error) {
+        return res.status(500).json({ 
+            error: 'Error al enviar el mensaje de flujo', 
+            details: error.message 
         });
     }
 });
