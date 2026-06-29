@@ -86,7 +86,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia
+// 3. Enviar OTP seleccionando la instancia (CON MEJORAS ANTIBLOQUEO)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code } = req.body;
 
@@ -100,23 +100,51 @@ app.post('/instance/send-otp', async (req, res) => {
     }
 
     try {
-        const jid = `${phone}@s.whatsapp.net`;
+        const cleanedPhone = phone.trim();
+        let targetJid = `${cleanedPhone}@s.whatsapp.net`;
+
+        // MEJORA 1: Sincronización y verificación previa del contacto en los servidores de WhatsApp
+        // Esto fuerza a Meta a reconocer el número y genera metadatos de handshake iniciales
+        const [result] = await instance.sock.onWhatsApp(cleanedPhone);
+        
+        if (!result || !result.exists) {
+            return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
+        }
+        
+        // Usamos el JID formateado/validado exacto devuelto por WhatsApp
+        targetJid = result.jid;
+
+        // MEJORA 2: Simulación de presencia "Composing" (Escribiendo...)
+        // Esto le avisa al servidor de WhatsApp que un humano está interactuando con la interfaz
+        await instance.sock.sendPresenceUpdate('composing', targetJid);
+        
+        // Espera de 2 segundos simulando la escritura
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // MEJORA 3: Pausar el estado de escritura justo antes de enviar
+        await instance.sock.sendPresenceUpdate('paused', targetJid);
+
         const message = `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-        await instance.sock.sendMessage(jid, { text: message });
+        // Envío final del mensaje
+        await instance.sock.sendMessage(targetJid, { text: message });
+        
         return res.status(200).json({ success: true, message: 'OTP enviado con éxito' });
     } catch (error) {
-        return res.status(500).json({ error: 'Error al enviar el mensaje', details: error.message });
+        // Captura avanzada del error para que tu backend sepa exactamente si fue el Error 463
+        console.error(`[${instanceId}] Error al enviar OTP:`, error);
+        return res.status(500).json({ 
+            error: 'Error al enviar el mensaje', 
+            details: error.message,
+            isRestricted: error.message?.includes('463') // Útil si tu backend quiere cambiar a SMS automáticamente
+        });
     }
 });
 
 // 4. Servidor en escucha y auto-restauración
-// 4. Servidor en escucha y auto-restauración
-// CAMBIO PRODUCTIVO: Usa el puerto del entorno o el 3000 por defecto
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, '0.0.0.0', () => { 
-    // Nota: Añadir '0.0.0.0' expone el servidor a la red externa en entornos Linux/Docker
     console.log(`API Multi-Instancia corriendo de forma segura en el puerto: ${PORT}`);
     
     const sessionsDir = path.join(__dirname, 'sessions');
@@ -130,40 +158,37 @@ app.listen(PORT, '0.0.0.0', () => {
     }
 });
 
-
-// 3.5 Enviar Mensaje Genérico (Notificaciones de flujos, alertas, etc.)
+// 3.5 Enviar Mensaje Genérico (Optimizado igual que el OTP)
 app.post('/instance/send-message', async (req, res) => {
     const { instanceId, phone, message } = req.body;
 
-    // Validación de parámetros esenciales
     if (!instanceId || !phone || !message) {
-        return res.status(400).json({ 
-            error: 'Faltan parámetros obligatorios: instanceId, phone o message' 
-        });
+        return res.status(400).json({ error: 'Faltan parámetros obligatorios: instanceId, phone o message' });
     }
 
     const instance = instances.get(instanceId);
     if (!instance || instance.status !== 'CONNECTED') {
-        return res.status(400).json({ 
-            error: `La instancia [${instanceId}] no está conectada o lista.` 
-        });
+        return res.status(400).json({ error: `La instancia [${instanceId}] no está conectada o lista.` });
     }
 
     try {
-        // Aseguramos el formato del JID de WhatsApp
-        const jid = `${phone.trim()}@s.whatsapp.net`;
+        const cleanedPhone = phone.trim();
+        let targetJid = `${cleanedPhone}@s.whatsapp.net`;
 
-        // Enviamos el texto crudo enviado desde tu backend
-        await instance.sock.sendMessage(jid, { text: message });
+        // Mismas mejoras de comportamiento aplicadas aquí
+        const [result] = await instance.sock.onWhatsApp(cleanedPhone);
+        if (result && result.exists) {
+            targetJid = result.jid;
+        }
+
+        await instance.sock.sendPresenceUpdate('composing', targetJid);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        await instance.sock.sendPresenceUpdate('paused', targetJid);
+
+        await instance.sock.sendMessage(targetJid, { text: message });
         
-        return res.status(200).json({ 
-            success: true, 
-            message: 'Mensaje de flujo enviado con éxito' 
-        });
+        return res.status(200).json({ success: true, message: 'Mensaje de flujo enviado con éxito' });
     } catch (error) {
-        return res.status(500).json({ 
-            error: 'Error al enviar el mensaje de flujo', 
-            details: error.message 
-        });
+        return res.status(500).json({ error: 'Error al enviar el mensaje de flujo', details: error.message });
     }
 });
