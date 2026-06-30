@@ -23,7 +23,8 @@ async function initInstance(instanceId) {
 
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true 
+        printQRInTerminal: true,
+        shouldSyncHistoryMessage: () => false // Mitiga errores de descifrado innecesarios en Render
     });
 
     instances.set(instanceId, { sock, qr: null, status: 'INITIALIZING' });
@@ -93,7 +94,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia (CON MANEJO DE ERROR 463)
+// 3. Enviar OTP seleccionando la instancia (CON MANEJO DE ERROR 463 Y AUTO-REINTENTO)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code } = req.body;
 
@@ -106,45 +107,60 @@ app.post('/instance/send-otp', async (req, res) => {
         return res.status(400).json({ error: `La instancia [${instanceId}] no está conectada o lista.` });
     }
 
-    try {
-        const cleanedPhone = phone.trim();
-        let targetJid = `${cleanedPhone}@s.whatsapp.net`;
+    const maxAttempts = 2;
+    let attempt = 0;
 
-        // Verificación previa del contacto en los servidores de WhatsApp
-        const [result] = await instance.sock.onWhatsApp(cleanedPhone);
-        
-        if (!result || !result.exists) {
-            return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
+    while (attempt < maxAttempts) {
+        try {
+            attempt++;
+            const cleanedPhone = phone.trim();
+            let targetJid = `${cleanedPhone}@s.whatsapp.net`;
+
+            // Verificación previa del contacto en los servidores de WhatsApp
+            const [result] = await instance.sock.onWhatsApp(cleanedPhone);
+            
+            if (!result || !result.exists) {
+                return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
+            }
+            
+            targetJid = result.jid;
+
+            // Comportamiento humano simulado
+            await instance.sock.sendPresenceUpdate('composing', targetJid);
+            
+            // Si es el segundo intento, aumentamos el tiempo de "composing" a 5 segundos para enfriar el canal
+            await delay(attempt === 1 ? 2000 : 5000); 
+            
+            await instance.sock.sendPresenceUpdate('paused', targetJid);
+
+            const message = `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
+
+            // Envío final del mensaje
+            await instance.sock.sendMessage(targetJid, { text: message });
+            
+            return res.status(200).json({ success: true, message: 'OTP enviado con éxito' });
+            
+        } catch (error) {
+            console.error(`[${instanceId}] Error en intento ${attempt} al enviar OTP:`, error);
+
+            const errorMessage = error.message || '';
+            const rawErrorData = error.jsonData || JSON.stringify(error);
+            const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463');
+
+            // Si detectamos el error 463 y aún nos queda un intento, pausamos y volvemos a intentar
+            if (isRestricted && attempt < maxAttempts) {
+                console.warn(`[${instanceId}] Detectado error 463. Esperando 3 segundos antes del reintento...`);
+                await delay(3000);
+                continue; // Forzar el siguiente ciclo del bucle while
+            }
+
+            // Si es otro tipo de error o ya se agotaron los intentos, devolvemos la respuesta definitiva de error
+            return res.status(500).json({ 
+                error: 'Error al enviar el mensaje de verificación', 
+                details: errorMessage,
+                isRestricted: isRestricted // Si persiste en true, activa el bypass Click-to-Chat en tu frontend
+            });
         }
-        
-        targetJid = result.jid;
-
-        // Comportamiento humano simulado
-        await instance.sock.sendPresenceUpdate('composing', targetJid);
-        await delay(2000);
-        await instance.sock.sendPresenceUpdate('paused', targetJid);
-
-        const message = `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
-
-        // Envío final del mensaje
-        await instance.sock.sendMessage(targetJid, { text: message });
-        
-        return res.status(200).json({ success: true, message: 'OTP enviado con éxito' });
-    } catch (error) {
-        console.error(`[${instanceId}] Error al enviar OTP:`, error);
-
-        // Extraemos la información del error nativo de WhatsApp / Baileys si viene en la respuesta del socket
-        const errorMessage = error.message || '';
-        const rawErrorData = error.jsonData || JSON.stringify(error);
-        
-        // El error 463 suele venir en el mensaje del error o estructurado en el árbol del payload de Baileys
-        const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463');
-
-        return res.status(500).json({ 
-            error: 'Error al enviar el mensaje de verificación', 
-            details: errorMessage,
-            isRestricted: isRestricted // Si es true, tu microservicio principal sabrá que debe disparar SMS
-        });
     }
 });
 
