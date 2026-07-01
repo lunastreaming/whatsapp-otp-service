@@ -9,6 +9,9 @@ app.use(express.json());
 
 const instances = new Map();
 
+// MEMORIA TEMPORAL AUTOLIMPIABLE: Almacena "telefono" => "codigo" para el bypass interactivo
+const pendingOtps = new Map();
+
 // Helper para pausar la ejecución de forma limpia
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -24,12 +27,59 @@ async function initInstance(instanceId) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: true,
-        shouldSyncHistoryMessage: () => false // Mitiga errores de descifrado innecesarios en Render
+        shouldSyncHistoryMessage: () => false // Evita procesar historial masivo antiguo al conectar
     });
 
     instances.set(instanceId, { sock, qr: null, status: 'INITIALIZING' });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // =======================================================================
+    // LISTENER EN VIVO: Captura el clic de contingencia ("Click-to-Chat")
+    // =======================================================================
+    sock.ev.on('messages.upsert', async (m) => {
+        if (m.type !== 'notify') return;
+
+        for (const msg of m.messages) {
+            // Saltamos si el mensaje es nuestro (enviado por el bot) o si proviene de un grupo
+            if (msg.key.fromMe || msg.key.remoteJid.endsWith('@g.us')) continue;
+
+            const incomingText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+            const cleanText = incomingText.trim().toLowerCase();
+
+            // Detecta la palabra clave exacta configurada en tu Frontend vía wa.me
+            if (cleanText.includes('solicito mi codigo otp') || cleanText.includes('solicito mi código otp')) {
+                const targetJid = msg.key.remoteJid;
+                const phoneWithoutJid = targetJid.split('@')[0]; // Extrae el número limpio (Ej: 51961762940)
+
+                console.log(`[${instanceId}] Solicitud entrante de bypass detectada para el teléfono: ${phoneWithoutJid}`);
+
+                // Buscamos si existe un código vigente en nuestra memoria volátil
+                const activeCode = pendingOtps.get(phoneWithoutJid);
+                let messageToReply = '';
+
+                if (activeCode) {
+                    // SI EXISTE: Reenviamos exactamente el mismo string del hash de Spring Boot
+                    messageToReply = `Tu código de verificación solicitado es: *${activeCode}*.\nIntrodúcelo en la casilla de tu pantalla actual.`;
+                } else {
+                    // SI YA EXPIRÓ (Pasaron los 5 minutos): Avisamos al cliente de manera clara
+                    messageToReply = `No encontramos ninguna solicitud de código activa o tu token ya expiró por seguridad. Por favor, vuelve a intentarlo desde la web.`;
+                }
+
+                try {
+                    // Simulación humana nativa en el chat abierto
+                    await sock.sendPresenceUpdate('composing', targetJid);
+                    await delay(1500);
+                    await sock.sendPresenceUpdate('paused', targetJid);
+
+                    await sock.sendMessage(targetJid, { text: messageToReply });
+                    console.log(`[${instanceId}] Contingencia respondida con éxito a: ${phoneWithoutJid}`);
+                } catch (err) {
+                    console.error(`[${instanceId}] Error enviando respuesta en el Listener de contingencia:`, err);
+                }
+            }
+        }
+    });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -49,7 +99,6 @@ async function initInstance(instanceId) {
             
             console.log(`[${instanceId}] Conexión cerrada. Razón/Status: ${statusCode}. ¿Reconectando?: ${shouldReconnect}`);
             
-            // Limpiamos la instancia actual de memoria
             instances.delete(instanceId);
 
             if (shouldReconnect) {
@@ -94,9 +143,9 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia (CON MANEJO DE ERROR 463 Y AUTO-REINTENTO)
+// 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO)
 app.post('/instance/send-otp', async (req, res) => {
-    const { instanceId, phone, code } = req.body;
+    const { instanceId, phone, code, message } = req.body;
 
     if (!instanceId || !phone || !code) {
         return res.status(400).json({ error: 'Faltan parámetros obligatorios: instanceId, phone o code' });
@@ -107,16 +156,29 @@ app.post('/instance/send-otp', async (req, res) => {
         return res.status(400).json({ error: `La instancia [${instanceId}] no está conectada o lista.` });
     }
 
+    const cleanedPhone = phone.trim();
+
+    // =======================================================================
+    // REGISTRO DE SEGURIDAD EN MEMORIA: Evita la persistencia infinita en RAM
+    // =======================================================================
+    pendingOtps.set(cleanedPhone, code);
+    
+    // El registro vive estrictamente 5 minutos (300000 ms) y luego se limpia solo
+    setTimeout(() => {
+        if (pendingOtps.get(cleanedPhone) === code) {
+            pendingOtps.delete(cleanedPhone);
+            console.log(`[Memory Garbage Collector] Código expirado y limpiado para el número: ${cleanedPhone}`);
+        }
+    }, 5 * 60 * 1000);
+
     const maxAttempts = 2;
     let attempt = 0;
 
     while (attempt < maxAttempts) {
         try {
             attempt++;
-            const cleanedPhone = phone.trim();
             let targetJid = `${cleanedPhone}@s.whatsapp.net`;
 
-            // Verificación previa del contacto en los servidores de WhatsApp
             const [result] = await instance.sock.onWhatsApp(cleanedPhone);
             
             if (!result || !result.exists) {
@@ -125,20 +187,16 @@ app.post('/instance/send-otp', async (req, res) => {
             
             targetJid = result.jid;
 
-            // Comportamiento humano simulado
             await instance.sock.sendPresenceUpdate('composing', targetJid);
-            
-            // Si es el segundo intento, aumentamos el tiempo de "composing" a 5 segundos para enfriar el canal
             await delay(attempt === 1 ? 2000 : 5000); 
-            
             await instance.sock.sendPresenceUpdate('paused', targetJid);
 
-            const message = `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
+            // Prioriza usar la plantilla estructurada que viene desde tu Spring Boot (message)
+            const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-            // Envío final del mensaje
-            await instance.sock.sendMessage(targetJid, { text: message });
+            await instance.sock.sendMessage(targetJid, { text: finalMessage });
             
-            return res.status(200).json({ success: true, message: 'OTP enviado con éxito' });
+            return res.status(200).json({ success: true, message: 'OTP enviado con éxito por vía directa' });
             
         } catch (error) {
             console.error(`[${instanceId}] Error en intento ${attempt} al enviar OTP:`, error);
@@ -147,18 +205,16 @@ app.post('/instance/send-otp', async (req, res) => {
             const rawErrorData = error.jsonData || JSON.stringify(error);
             const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463');
 
-            // Si detectamos el error 463 y aún nos queda un intento, pausamos y volvemos a intentar
             if (isRestricted && attempt < maxAttempts) {
                 console.warn(`[${instanceId}] Detectado error 463. Esperando 3 segundos antes del reintento...`);
                 await delay(3000);
-                continue; // Forzar el siguiente ciclo del bucle while
+                continue; 
             }
 
-            // Si es otro tipo de error o ya se agotaron los intentos, devolvemos la respuesta definitiva de error
             return res.status(500).json({ 
                 error: 'Error al enviar el mensaje de verificación', 
                 details: errorMessage,
-                isRestricted: isRestricted // Si persiste en true, activa el bypass Click-to-Chat en tu frontend
+                isRestricted: isRestricted 
             });
         }
     }
