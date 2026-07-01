@@ -12,6 +12,8 @@ const instances = new Map();
 // MEMORIA TEMPORAL AUTOLIMPIABLE: Almacena "telefono" => "codigo" para el bypass interactivo
 const pendingOtps = new Map();
 
+const blacklistedMsgIds = new Map();
+
 // Helper para pausar la ejecución de forma limpia
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -64,10 +66,41 @@ async function initInstance(instanceId) {
     const sessionPath = path.join(__dirname, 'sessions', instanceId);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
+    // 🚨 CONFIGURAMOS UN LOGGER PROXY PARA INTERCEPTAR EL LOG SILENCIOSO DE BAILEYS
+    const P = require('pino');
+    const customLogger = P({ level: 'info' }, P.destination({
+        write(msg) {
+            // Imprime el log normal en la consola de Render para que no pierdas visibilidad
+            process.stdout.write(msg);
+
+            // Analizamos el texto plano del log que Baileys está enviando
+            if (msg.includes('error 463') || msg.includes('restricted')) {
+                try {
+                    const logObj = JSON.parse(msg);
+                    if (logObj.msgId) {
+                        console.warn(`[Logger Interceptor] 🎯 ¡Atrapado error 463 in-flight para el msgId: ${logObj.msgId}! Agregando a lista negra.`);
+                        blacklistedMsgIds.set(logObj.msgId, true);
+                        
+                        // Auto-limpieza en 10 segundos para no saturar memoria
+                        setTimeout(() => blacklistedMsgIds.delete(logObj.msgId), 10000);
+                    }
+                } catch (e) {
+                    // Si el log no era JSON válido, buscamos el msgId por regex básico
+                    const match = msg.match(/"msgId":"([^"]+)"/);
+                    if (match && match[1]) {
+                        console.warn(`[Logger Interceptor Regex] 🎯 Atrapado msgId: ${match[1]}`);
+                        blacklistedMsgIds.set(match[1], true);
+                    }
+                }
+            }
+        }
+    }));
+
     const sock = makeWASocket({
         auth: state,
+        logger: customLogger, // <-- Le inyectamos nuestro interceptor de logs
         printQRInTerminal: true,
-        shouldSyncHistoryMessage: () => false // Evita procesar historial masivo antiguo al conectar
+        shouldSyncHistoryMessage: () => false
     });
 
     instances.set(instanceId, { sock, qr: null, status: 'INITIALIZING' });
@@ -183,8 +216,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO)
-// 3. Enviar OTP seleccionando la instancia (INTERCEPTOR DE ESTADOS DE ENTREGA EN TIEMPO REAL)
+// 3. Enviar OTP seleccionando la instancia (BLINDADO MEDIANTE INTERCEPCIÓN DE LOGGER)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -226,38 +258,39 @@ app.post('/instance/send-otp', async (req, res) => {
             targetJid = resultWhatsApp.jid;
 
             await instance.sock.sendPresenceUpdate('composing', targetJid);
-            await delay(attempt === 1 ? 1500 : 4000); 
+            await delay(attempt === 1 ? 1000 : 3000); 
             await instance.sock.sendPresenceUpdate('paused', targetJid);
 
             const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-            // 1. Despachamos el mensaje
+            // 1. Enviamos el mensaje y obtenemos su ID inmediatamente
             const sentMessageResponse = await instance.sock.sendMessage(targetJid, { text: finalMessage });
             const msgId = sentMessageResponse?.key?.id;
 
             if (msgId) {
-                console.log(`[${instanceId}] Mensaje despachado con ID: ${msgId}. Monitoreando entrega interna...`);
-                
-                // 2. Esperamos el veredicto del listener para ver si Meta lo rebota silenciosamente
-                const deliveryCheck = await waitForMessageStatus(instance.sock, msgId, 2500);
+                // 2. Tiempo de gracia mínimo (600ms) para que el socket procese el rechazo de Meta y el Logger dispare
+                await delay(600);
 
-                if (deliveryCheck.failed && deliveryCheck.isRestricted) {
+                // 3. Verificamos si el Logger atrapó el error 463 para este ID específico
+                if (blacklistedMsgIds.has(msgId)) {
+                    blacklistedMsgIds.delete(msgId); // Limpieza inmediata
+
                     if (attempt < maxAttempts) {
-                        console.warn(`[${instanceId}] Confirmado error 463 por Listener en intento ${attempt}. Reintentando...`);
-                        await delay(3000);
-                        continue;
+                        console.warn(`[${instanceId}] Error 463 confirmado por interceptor de logs en intento ${attempt}. Reintentando...`);
+                        await delay(2500);
+                        continue; 
                     } else {
-                        console.warn(`[${instanceId}] Error 463 persistente en el Listener tras ${attempt} intentos. Forzando contingencia.`);
+                        console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos (Vía Logger). Forzando contingencia.`);
                         return res.status(200).json({ 
                             success: true, 
                             isRestricted: true, 
-                            message: 'Bypass de contingencia activado (Detectado Error 463 asíncrono).' 
+                            message: 'Bypass de contingencia activado (Error 463 capturado desde el Logger core).' 
                         });
                     }
                 }
             }
 
-            // Si el listener no detectó anomalías en el tiempo de gracia, respondemos éxito real
+            // Si el ID del mensaje no fue marcado como erróneo en el log, es un éxito real de red
             return res.status(200).json({ 
                 success: true, 
                 isRestricted: false, 
@@ -265,18 +298,12 @@ app.post('/instance/send-otp', async (req, res) => {
             });
             
         } catch (error) {
-            console.error(`[${instanceId}] Error crítico en catch de intento ${attempt}:`, error);
-            
+            console.error(`[${instanceId}] Error crítico en catch:`, error);
             if (attempt < maxAttempts) {
-                await delay(3000);
+                await delay(2000);
                 continue;
             }
-
-            return res.status(500).json({ 
-                error: 'Error al enviar el mensaje de verificación', 
-                details: error.message,
-                isRestricted: false 
-            });
+            return res.status(500).json({ error: 'Error interno en pasarela', details: error.message, isRestricted: false });
         }
     }
 });
