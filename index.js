@@ -12,7 +12,8 @@ const instances = new Map();
 // MEMORIA TEMPORAL AUTOLIMPIABLE: Almacena "telefono" => "codigo" para el bypass interactivo
 const pendingOtps = new Map();
 
-const blacklistedMsgIds = new Map();
+// Monitoreo proactivo de ráfagas de error 463
+let lastRestrictionDetectedAt = 0;
 
 // Helper para pausar la ejecución de forma limpia
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -63,42 +64,26 @@ async function initInstance(instanceId) {
         return;
     }
 
-    const sessionPath = path.join(__dirname, 'sessions', instanceId);
+const sessionPath = path.join(__dirname, 'sessions', instanceId);
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-    // 🚨 CONFIGURAMOS UN LOGGER PROXY PARA INTERCEPTAR EL LOG SILENCIOSO DE BAILEYS
     const P = require('pino');
     const customLogger = P({ level: 'info' }, P.destination({
         write(msg) {
-            // Imprime el log normal en la consola de Render para que no pierdas visibilidad
+            // Mantenemos la salida en los logs de Render
             process.stdout.write(msg);
 
-            // Analizamos el texto plano del log que Baileys está enviando
+            // Si el log contiene la restricción 463, guardamos el milisegundo exacto del fallo
             if (msg.includes('error 463') || msg.includes('restricted')) {
-                try {
-                    const logObj = JSON.parse(msg);
-                    if (logObj.msgId) {
-                        console.warn(`[Logger Interceptor] 🎯 ¡Atrapado error 463 in-flight para el msgId: ${logObj.msgId}! Agregando a lista negra.`);
-                        blacklistedMsgIds.set(logObj.msgId, true);
-                        
-                        // Auto-limpieza en 10 segundos para no saturar memoria
-                        setTimeout(() => blacklistedMsgIds.delete(logObj.msgId), 10000);
-                    }
-                } catch (e) {
-                    // Si el log no era JSON válido, buscamos el msgId por regex básico
-                    const match = msg.match(/"msgId":"([^"]+)"/);
-                    if (match && match[1]) {
-                        console.warn(`[Logger Interceptor Regex] 🎯 Atrapado msgId: ${match[1]}`);
-                        blacklistedMsgIds.set(match[1], true);
-                    }
-                }
+                console.warn(`[⚠️ Alerta Global] Error 463 detectado en los flujos de red de Meta. Registrando marca de restricción.`);
+                lastRestrictionDetectedAt = Date.now();
             }
         }
     }));
 
     const sock = makeWASocket({
         auth: state,
-        logger: customLogger, // <-- Le inyectamos nuestro interceptor de logs
+        logger: customLogger,
         printQRInTerminal: true,
         shouldSyncHistoryMessage: () => false
     });
@@ -216,7 +201,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia (BLINDADO MEDIANTE INTERCEPCIÓN DE LOGGER)
+// 3. Enviar OTP seleccionando la instancia (ESTRATEGIA DE MONITOREO DE RÁFAGA GLOBAL)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -231,7 +216,7 @@ app.post('/instance/send-otp', async (req, res) => {
 
     const cleanedPhone = phone.trim();
 
-    // REGISTRO DE SEGURIDAD EN MEMORIA
+    // REGISTRO DE SEGURIDAD EN MEMORIA PARA EL BYPASS MANUAL (CLICK-TO-CHAT)
     pendingOtps.set(cleanedPhone, code);
     
     setTimeout(() => {
@@ -263,34 +248,35 @@ app.post('/instance/send-otp', async (req, res) => {
 
             const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-            // 1. Enviamos el mensaje y obtenemos su ID inmediatamente
-            const sentMessageResponse = await instance.sock.sendMessage(targetJid, { text: finalMessage });
-            const msgId = sentMessageResponse?.key?.id;
+            // Limpiamos marcas de tiempo anteriores antes de enviar para evitar falsos positivos viejos
+            const preSendTime = Date.now();
 
-            if (msgId) {
-                // 2. Tiempo de gracia mínimo (600ms) para que el socket procese el rechazo de Meta y el Logger dispare
-                await delay(600);
+            // 1. Despachamos el mensaje (Baileys resolverá la promesa casi de inmediato)
+            await instance.sock.sendMessage(targetJid, { text: finalMessage });
 
-                // 3. Verificamos si el Logger atrapó el error 463 para este ID específico
-                if (blacklistedMsgIds.has(msgId)) {
-                    blacklistedMsgIds.delete(msgId); // Limpieza inmediata
+            // 2. Tiempo de gracia obligatorio (800ms) para permitir que el WebSocket reciba el rechazo y el logger escriba
+            await delay(800);
 
-                    if (attempt < maxAttempts) {
-                        console.warn(`[${instanceId}] Error 463 confirmado por interceptor de logs en intento ${attempt}. Reintentando...`);
-                        await delay(2500);
-                        continue; 
-                    } else {
-                        console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos (Vía Logger). Forzando contingencia.`);
-                        return res.status(200).json({ 
-                            success: true, 
-                            isRestricted: true, 
-                            message: 'Bypass de contingencia activado (Error 463 capturado desde el Logger core).' 
-                        });
-                    }
+            // 3. EVALUACIÓN DE RESTRICCIÓN: ¿Se registró un error 463 desde que iniciamos el envío?
+            // Añadimos un umbral de hasta 2 segundos atrás por si el desfase de red en Render altera el orden
+            if (lastRestrictionDetectedAt >= (preSendTime - 2000)) {
+                console.warn(`[${instanceId}] Cruce de datos positivo: Se detectó un error 463 concurrentemente con este envío.`);
+                
+                if (attempt < maxAttempts) {
+                    console.warn(`[${instanceId}] Reintentando intento ${attempt + 1} por sospecha de restricción...`);
+                    await delay(2000);
+                    continue;
+                } else {
+                    console.warn(`[${instanceId}] Restricción de Meta confirmada tras reintentos. Forzando contingencia HTTP 200.`);
+                    return res.status(200).json({ 
+                        success: true, 
+                        isRestricted: true, 
+                        message: 'Bypass de contingencia activado (Canal bloqueado por Meta Error 463).' 
+                    });
                 }
             }
 
-            // Si el ID del mensaje no fue marcado como erróneo en el log, es un éxito real de red
+            // Si el logger se mantuvo en silencio durante el envío, el mensaje salió correctamente
             return res.status(200).json({ 
                 success: true, 
                 isRestricted: false, 
