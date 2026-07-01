@@ -99,41 +99,48 @@ const sessionPath = path.join(__dirname, 'sessions', instanceId);
         if (m.type !== 'notify') return;
 
         for (const msg of m.messages) {
-            // Saltamos si el mensaje es nuestro (enviado por el bot) o si proviene de un grupo
             if (msg.key.fromMe || msg.key.remoteJid.endsWith('@g.us')) continue;
 
             const incomingText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
             const cleanText = incomingText.trim().toLowerCase();
 
-            // Detecta la palabra clave exacta configurada en tu Frontend vía wa.me
             if (cleanText.includes('solicito mi codigo otp') || cleanText.includes('solicito mi código otp')) {
                 const targetJid = msg.key.remoteJid;
-                const phoneWithoutJid = targetJid.split('@')[0]; // Extrae el número limpio (Ej: 51961762940)
+                const rawPhone = targetJid.split('@')[0]; // Ej: "5491123456789" (Argentina) o "51961762940" (Perú)
 
-                console.log(`[${instanceId}] Solicitud entrante de bypass detectada para el teléfono: ${phoneWithoutJid}`);
+                // EVITAR DUPLICADOS EN LA MISMA FRACCIÓN DE SEGUNDO
+                const msgKey = `proc:${msg.key.id}`;
+                if (pendingOtps.has(msgKey)) continue; 
+                pendingOtps.set(msgKey, true);
+                setTimeout(() => pendingOtps.delete(msgKey), 10000);
 
-                // Buscamos si existe un código vigente en nuestra memoria volátil
-                const activeCode = pendingOtps.get(phoneWithoutJid);
+                console.log(`[${instanceId}] Solicitud entrante detectada para el JID: ${rawPhone}`);
+
+                // 🚨 BÚSQUEDA MULTI-FORMATO INTERNACIONAL
+                // 1. Intentamos buscar con el número completo tal cual llega de WhatsApp (ej: 54911...)
+                // 2. Si no lo encuentra, extraemos los últimos 9 dígitos (ej: 123456789) que es el estándar más común
+                const shortPhoneForm = rawPhone.length >= 9 ? rawPhone.slice(-9) : rawPhone;
+                
+                const activeCode = pendingOtps.get(rawPhone) || pendingOtps.get(shortPhoneForm);
+
                 let messageToReply = '';
 
                 if (activeCode) {
-                    // SI EXISTE: Reenviamos exactamente el mismo string del hash de Spring Boot
                     messageToReply = `Tu código de verificación solicitado es: *${activeCode}*.\nIntrodúcelo en la casilla de tu pantalla actual.`;
                 } else {
-                    // SI YA EXPIRÓ (Pasaron los 5 minutos): Avisamos al cliente de manera clara
+                    console.warn(`[${instanceId}] No se encontró token en memoria para el número internacional: ${rawPhone}`);
                     messageToReply = `No encontramos ninguna solicitud de código activa o tu token ya expiró por seguridad. Por favor, vuelve a intentarlo desde la web.`;
                 }
 
                 try {
-                    // Simulación humana nativa en el chat abierto
                     await sock.sendPresenceUpdate('composing', targetJid);
-                    await delay(1500);
+                    await delay(1200);
                     await sock.sendPresenceUpdate('paused', targetJid);
 
                     await sock.sendMessage(targetJid, { text: messageToReply });
-                    console.log(`[${instanceId}] Contingencia respondida con éxito a: ${phoneWithoutJid}`);
+                    console.log(`[${instanceId}] Contingencia respondida con éxito a: ${rawPhone}`);
                 } catch (err) {
-                    console.error(`[${instanceId}] Error enviando respuesta en el Listener de contingencia:`, err);
+                    console.error(`[${instanceId}] Error enviando respuesta en el Listener:`, err);
                 }
             }
         }
@@ -214,12 +221,16 @@ app.post('/instance/send-otp', async (req, res) => {
         return res.status(400).json({ error: `La instancia [${instanceId}] no está conectada o lista.` });
     }
 
-    const cleanedPhone = phone.trim();
+    const cleanedPhone = phone.trim().replace(/\D/g, ''); // Elimina cualquier caracter no numérico
 
-    // =======================================================================
-    // 1. ANCLAJE INMEDIATO EN MEMORIA (Garantiza que el Click-to-Chat funcione)
-    // =======================================================================
+    // Guardamos la versión completa tal cual viene
     pendingOtps.set(cleanedPhone, code);
+    
+    // Guardamos también la variante de los últimos 9 dígitos por si el JID de entrada difiere en prefijos
+    if (cleanedPhone.length >= 9) {
+        const globalShortForm = cleanedPhone.slice(-9);
+        pendingOtps.set(globalShortForm, code);
+    }
     
     // El registro vive estrictamente 5 minutos y luego se limpia solo
     setTimeout(() => {
