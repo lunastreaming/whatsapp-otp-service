@@ -106,33 +106,48 @@ const sessionPath = path.join(__dirname, 'sessions', instanceId);
 
             if (cleanText.includes('solicito mi codigo otp') || cleanText.includes('solicito mi código otp')) {
                 const targetJid = msg.key.remoteJid;
-                const rawPhone = targetJid.split('@')[0]; // Ej: "5491123456789" (Argentina) o "51961762940" (Perú)
+                const rawPhone = targetJid.split('@')[0].replace(/\D/g, ''); // Ej: "989876543" o "51989876543"
 
-                // EVITAR DUPLICADOS EN LA MISMA FRACCIÓN DE SEGUNDO
+                // 1. EVITAR DUPLICADOS EN LA MISMA FRACCIÓN DE SEGUNDO
                 const msgKey = `proc:${msg.key.id}`;
                 if (pendingOtps.has(msgKey)) continue; 
                 pendingOtps.set(msgKey, true);
                 setTimeout(() => pendingOtps.delete(msgKey), 10000);
 
-                console.log(`[${instanceId}] Solicitud entrante detectada para el JID: ${rawPhone}`);
+                console.log(`[${instanceId}] Buscando código para el remitente real de WhatsApp: ${rawPhone}`);
 
-                // 🚨 BÚSQUEDA MULTI-FORMATO INTERNACIONAL
-                // 1. Intentamos buscar con el número completo tal cual llega de WhatsApp (ej: 54911...)
-                // 2. Si no lo encuentra, extraemos los últimos 9 dígitos (ej: 123456789) que es el estándar más común
-                const shortPhoneForm = rawPhone.length >= 9 ? rawPhone.slice(-9) : rawPhone;
+                // 2. BÚSQUEDA ROBUSTA POR COINCIDENCIA DE COLA TELEFÓNICA (Últimos 8 dígitos)
+                let activeCode = null;
+                const rawPhoneTail = rawPhone.length >= 8 ? rawPhone.slice(-8) : rawPhone;
                 
-                const activeCode = pendingOtps.get(rawPhone) || pendingOtps.get(shortPhoneForm);
+                for (const [savedPhone, savedCode] of pendingOtps.entries()) {
+                    // Saltamos las llaves de control de ráfaga de duplicados
+                    if (savedPhone.startsWith('proc:')) continue;
+
+                    const savedPhoneTail = savedPhone.length >= 8 ? savedPhone.slice(-8) : savedPhone;
+
+                    // Si las colas de los números coinciden exactamente, tenemos un Match perfecto 
+                    // de usuario internacional sin importar el prefijo que traiga Meta.
+                    if (rawPhoneTail === savedPhoneTail) {
+                        activeCode = savedCode;
+                        console.log(`[${instanceId}] 🎯 Match Exitoso Encontrado -> Registrado: ${savedPhone} <==> Remitente WA: ${rawPhone}`);
+                        break;
+                    }
+                }
 
                 let messageToReply = '';
 
                 if (activeCode) {
                     messageToReply = `Tu código de verificación solicitado es: *${activeCode}*.\nIntrodúcelo en la casilla de tu pantalla actual.`;
                 } else {
-                    console.warn(`[${instanceId}] No se encontró token en memoria para el número internacional: ${rawPhone}`);
+                    console.warn(`[${instanceId}] ❌ No hubo coincidencia en RAM para: ${rawPhone}. Claves activas:`, 
+                        Array.from(pendingOtps.keys()).filter(k => !k.startsWith('proc:'))
+                    );
                     messageToReply = `No encontramos ninguna solicitud de código activa o tu token ya expiró por seguridad. Por favor, vuelve a intentarlo desde la web.`;
                 }
 
                 try {
+                    // Simulación humana en el chat abierto
                     await sock.sendPresenceUpdate('composing', targetJid);
                     await delay(1200);
                     await sock.sendPresenceUpdate('paused', targetJid);
