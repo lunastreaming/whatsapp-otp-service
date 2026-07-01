@@ -143,7 +143,7 @@ const sessionPath = path.join(__dirname, 'sessions', instanceId);
                     console.warn(`[${instanceId}] ❌ No hubo coincidencia en RAM para: ${rawPhone}. Claves activas:`, 
                         Array.from(pendingOtps.keys()).filter(k => !k.startsWith('proc:'))
                     );
-                    messageToReply = `No encontramos ninguna solicitud de código activa o tu token ya expiró por seguridad. Por favor, vuelve a intentarlo desde la web.`;
+                    messageToReply = `Intenta registrarte nuevamente desde la web para proporcionarte el código`;
                 }
 
                 try {
