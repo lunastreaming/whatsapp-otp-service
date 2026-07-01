@@ -144,7 +144,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
 });
 
 // 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO)
-// 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO CORREGIDO)
+// 3. Enviar OTP seleccionando la instancia (BLINDADO CONTRA LOGS SILENCIOSOS DE BAILEYS)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -159,12 +159,9 @@ app.post('/instance/send-otp', async (req, res) => {
 
     const cleanedPhone = phone.trim();
 
-    // =======================================================================
-    // REGISTRO DE SEGURIDAD EN MEMORIA: Evita la persistencia infinita en RAM
-    // =======================================================================
+    // REGISTRO DE SEGURIDAD EN MEMORIA
     pendingOtps.set(cleanedPhone, code);
     
-    // El registro vive estrictamente 5 minutos (300000 ms) y luego se limpia solo
     setTimeout(() => {
         if (pendingOtps.get(cleanedPhone) === code) {
             pendingOtps.delete(cleanedPhone);
@@ -180,24 +177,31 @@ app.post('/instance/send-otp', async (req, res) => {
             attempt++;
             let targetJid = `${cleanedPhone}@s.whatsapp.net`;
 
-            const [result] = await instance.sock.onWhatsApp(cleanedPhone);
+            const [resultWhatsApp] = await instance.sock.onWhatsApp(cleanedPhone);
             
-            if (!result || !result.exists) {
+            if (!resultWhatsApp || !resultWhatsApp.exists) {
                 return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
             }
             
-            targetJid = result.jid;
+            targetJid = resultWhatsApp.jid;
 
             await instance.sock.sendPresenceUpdate('composing', targetJid);
             await delay(attempt === 1 ? 2000 : 5000); 
             await instance.sock.sendPresenceUpdate('paused', targetJid);
 
-            // Prioriza usar la plantilla estructurada que viene desde tu Spring Boot (message)
             const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-            await instance.sock.sendMessage(targetJid, { text: finalMessage });
+            // 🚨 CAPTURAMOS EL OBJETO DE RESPUESTA DE BAILEYS
+            const sentMessageResponse = await instance.sock.sendMessage(targetJid, { text: finalMessage });
             
-            // Si el mensaje se envía con éxito, retornamos isRestricted: false
+            // Analizar si Baileys guardó un estado de error/restricción de forma silenciosa en el objeto retornado
+            const responseStr = JSON.stringify(sentMessageResponse || {});
+            if (responseStr.includes('463') || responseStr.includes('restricted')) {
+                // Forzamos manualmente el flujo de error 463 simulando una excepción para que lo maneje el catch de abajo
+                throw new Error('STATUS_463_DETECTED_IN_RESPONSE');
+            }
+
+            // Si pasó la validación, realmente se envió por vía directa
             return res.status(200).json({ 
                 success: true, 
                 isRestricted: false, 
@@ -205,33 +209,32 @@ app.post('/instance/send-otp', async (req, res) => {
             });
             
         } catch (error) {
-            console.error(`[${instanceId}] Error en intento ${attempt} al enviar OTP:`, error);
+            console.error(`[${instanceId}] Error gestionado en intento ${attempt} al enviar OTP:`, error);
 
             const errorMessage = error.message || '';
             const rawErrorData = error.jsonData || JSON.stringify(error);
             
-            // Detección estricta del error 463 de Meta
-            const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463') || errorMessage.includes('restricted');
+            // Evaluamos si es nuestro error forzado o un error lanzado por la librería
+            const isRestricted = errorMessage.includes('463') || 
+                                 rawErrorData.includes('463') || 
+                                 errorMessage.includes('restricted') ||
+                                 errorMessage === 'STATUS_463_DETECTED_IN_RESPONSE';
 
             if (isRestricted) {
                 if (attempt < maxAttempts) {
-                    console.warn(`[${instanceId}] Detectado error 463 en intento ${attempt}. Esperando 3 segundos antes del reintento...`);
+                    console.warn(`[${instanceId}] Detectado error 463 (Silencioso). Reintentando en 3s...`);
                     await delay(3000);
-                    continue; // Ejecuta el intento 2
+                    continue; 
                 } else {
-                    // 🚨 AQUÍ ESTÁ EL CAMBIO CLAVE: Si ya agotó los intentos y sigue dando 463, 
-                    // devolvemos un HTTP 200 con isRestricted: true. De esta manera, Spring Boot 
-                    // sabrá que no es un error del servidor, sino un bypass controlado que debe dejar pasar.
-                    console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos. Activando bypass de contingencia.`);
+                    console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos. Activando desvío de contingencia.`);
                     return res.status(200).json({ 
                         success: true, 
                         isRestricted: true, 
-                        message: 'Bypass de contingencia activado por restricciones del canal directo (Meta Error 463).' 
+                        message: 'Bypass de contingencia activado por restricciones de Meta (Error 463).' 
                     });
                 }
             }
 
-            // Si es cualquier otro error que no sea el 463 (ej. caída de red), devolvemos HTTP 500
             return res.status(500).json({ 
                 error: 'Error al enviar el mensaje de verificación', 
                 details: errorMessage,
