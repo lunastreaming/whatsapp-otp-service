@@ -15,6 +15,46 @@ const pendingOtps = new Map();
 // Helper para pausar la ejecución de forma limpia
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Helper para esperar a ver si el mensaje enviado reporta un fallo de restricción/error de forma síncrona
+function waitForMessageStatus(sock, msgId, timeoutMs = 2500) {
+    return new Promise((resolve) => {
+        let isResolved = false;
+
+        const cleanUp = () => {
+            isResolved = true;
+            sock.ev.off('messages.update', updateListener);
+        };
+
+        const updateListener = (updates) => {
+            if (isResolved) return;
+            for (const update of updates) {
+                // Si la actualización corresponde a nuestro mensaje enviado
+                if (update.key && update.key.id === msgId) {
+                    // Evaluamos si Meta le asignó un estado de error
+                    const status = update.update?.status;
+                    // En Baileys, status 0 o valores de error/jsonData con 463 indican fallo
+                    if (status === 0 || JSON.stringify(update).includes('463')) {
+                        cleanUp();
+                        resolve({ failed: true, isRestricted: true });
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Escuchamos activamente las actualizaciones de estados de mensajes
+        sock.ev.on('messages.update', updateListener);
+
+        // Si pasan 2.5 segundos y no se reportó ningún error crítico, asumimos que fluyó bien
+        setTimeout(() => {
+            if (!isResolved) {
+                cleanUp();
+                resolve({ failed: false, isRestricted: false });
+            }
+        }, timeoutMs);
+    });
+}
+
 async function initInstance(instanceId) {
     if (instances.has(instanceId)) {
         console.log(`[${instanceId}] La instancia ya se encuentra activa en memoria.`);
@@ -144,7 +184,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
 });
 
 // 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO)
-// 3. Enviar OTP seleccionando la instancia (BLINDADO CONTRA LOGS SILENCIOSOS DE BAILEYS)
+// 3. Enviar OTP seleccionando la instancia (INTERCEPTOR DE ESTADOS DE ENTREGA EN TIEMPO REAL)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -186,22 +226,38 @@ app.post('/instance/send-otp', async (req, res) => {
             targetJid = resultWhatsApp.jid;
 
             await instance.sock.sendPresenceUpdate('composing', targetJid);
-            await delay(attempt === 1 ? 2000 : 5000); 
+            await delay(attempt === 1 ? 1500 : 4000); 
             await instance.sock.sendPresenceUpdate('paused', targetJid);
 
             const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
 
-            // 🚨 CAPTURAMOS EL OBJETO DE RESPUESTA DE BAILEYS
+            // 1. Despachamos el mensaje
             const sentMessageResponse = await instance.sock.sendMessage(targetJid, { text: finalMessage });
-            
-            // Analizar si Baileys guardó un estado de error/restricción de forma silenciosa en el objeto retornado
-            const responseStr = JSON.stringify(sentMessageResponse || {});
-            if (responseStr.includes('463') || responseStr.includes('restricted')) {
-                // Forzamos manualmente el flujo de error 463 simulando una excepción para que lo maneje el catch de abajo
-                throw new Error('STATUS_463_DETECTED_IN_RESPONSE');
+            const msgId = sentMessageResponse?.key?.id;
+
+            if (msgId) {
+                console.log(`[${instanceId}] Mensaje despachado con ID: ${msgId}. Monitoreando entrega interna...`);
+                
+                // 2. Esperamos el veredicto del listener para ver si Meta lo rebota silenciosamente
+                const deliveryCheck = await waitForMessageStatus(instance.sock, msgId, 2500);
+
+                if (deliveryCheck.failed && deliveryCheck.isRestricted) {
+                    if (attempt < maxAttempts) {
+                        console.warn(`[${instanceId}] Confirmado error 463 por Listener en intento ${attempt}. Reintentando...`);
+                        await delay(3000);
+                        continue;
+                    } else {
+                        console.warn(`[${instanceId}] Error 463 persistente en el Listener tras ${attempt} intentos. Forzando contingencia.`);
+                        return res.status(200).json({ 
+                            success: true, 
+                            isRestricted: true, 
+                            message: 'Bypass de contingencia activado (Detectado Error 463 asíncrono).' 
+                        });
+                    }
+                }
             }
 
-            // Si pasó la validación, realmente se envió por vía directa
+            // Si el listener no detectó anomalías en el tiempo de gracia, respondemos éxito real
             return res.status(200).json({ 
                 success: true, 
                 isRestricted: false, 
@@ -209,35 +265,16 @@ app.post('/instance/send-otp', async (req, res) => {
             });
             
         } catch (error) {
-            console.error(`[${instanceId}] Error gestionado en intento ${attempt} al enviar OTP:`, error);
-
-            const errorMessage = error.message || '';
-            const rawErrorData = error.jsonData || JSON.stringify(error);
+            console.error(`[${instanceId}] Error crítico en catch de intento ${attempt}:`, error);
             
-            // Evaluamos si es nuestro error forzado o un error lanzado por la librería
-            const isRestricted = errorMessage.includes('463') || 
-                                 rawErrorData.includes('463') || 
-                                 errorMessage.includes('restricted') ||
-                                 errorMessage === 'STATUS_463_DETECTED_IN_RESPONSE';
-
-            if (isRestricted) {
-                if (attempt < maxAttempts) {
-                    console.warn(`[${instanceId}] Detectado error 463 (Silencioso). Reintentando en 3s...`);
-                    await delay(3000);
-                    continue; 
-                } else {
-                    console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos. Activando desvío de contingencia.`);
-                    return res.status(200).json({ 
-                        success: true, 
-                        isRestricted: true, 
-                        message: 'Bypass de contingencia activado por restricciones de Meta (Error 463).' 
-                    });
-                }
+            if (attempt < maxAttempts) {
+                await delay(3000);
+                continue;
             }
 
             return res.status(500).json({ 
                 error: 'Error al enviar el mensaje de verificación', 
-                details: errorMessage,
+                details: error.message,
                 isRestricted: false 
             });
         }
