@@ -201,7 +201,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
     });
 });
 
-// 3. Enviar OTP seleccionando la instancia (ESTRATEGIA DE MONITOREO DE RÁFAGA GLOBAL)
+// 3. Enviar OTP seleccionando la instancia (ESTRATEGIA ATÓMICA POR DESVÍO DIRECTO)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -216,81 +216,57 @@ app.post('/instance/send-otp', async (req, res) => {
 
     const cleanedPhone = phone.trim();
 
-    // REGISTRO DE SEGURIDAD EN MEMORIA PARA EL BYPASS MANUAL (CLICK-TO-CHAT)
+    // =======================================================================
+    // 1. ANCLAJE INMEDIATO EN MEMORIA (Garantiza que el Click-to-Chat funcione)
+    // =======================================================================
     pendingOtps.set(cleanedPhone, code);
     
+    // El registro vive estrictamente 5 minutos y luego se limpia solo
     setTimeout(() => {
         if (pendingOtps.get(cleanedPhone) === code) {
             pendingOtps.delete(cleanedPhone);
-            console.log(`[Memory Garbage Collector] Código expirado y limpiado para el número: ${cleanedPhone}`);
+            console.log(`[Memory Garbage Collector] Código expirado y limpiado para: ${cleanedPhone}`);
         }
     }, 5 * 60 * 1000);
 
-    const maxAttempts = 2;
-    let attempt = 0;
+    try {
+        let targetJid = `${cleanedPhone}@s.whatsapp.net`;
 
-    while (attempt < maxAttempts) {
-        try {
-            attempt++;
-            let targetJid = `${cleanedPhone}@s.whatsapp.net`;
-
-            const [resultWhatsApp] = await instance.sock.onWhatsApp(cleanedPhone);
-            
-            if (!resultWhatsApp || !resultWhatsApp.exists) {
-                return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
-            }
-            
-            targetJid = resultWhatsApp.jid;
-
-            await instance.sock.sendPresenceUpdate('composing', targetJid);
-            await delay(attempt === 1 ? 1000 : 3000); 
-            await instance.sock.sendPresenceUpdate('paused', targetJid);
-
-            const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
-
-            // Limpiamos marcas de tiempo anteriores antes de enviar para evitar falsos positivos viejos
-            const preSendTime = Date.now();
-
-            // 1. Despachamos el mensaje (Baileys resolverá la promesa casi de inmediato)
-            await instance.sock.sendMessage(targetJid, { text: finalMessage });
-
-            // 2. Tiempo de gracia obligatorio (800ms) para permitir que el WebSocket reciba el rechazo y el logger escriba
-            await delay(800);
-
-            // 3. EVALUACIÓN DE RESTRICCIÓN: ¿Se registró un error 463 desde que iniciamos el envío?
-            // Añadimos un umbral de hasta 2 segundos atrás por si el desfase de red en Render altera el orden
-            if (lastRestrictionDetectedAt >= (preSendTime - 2000)) {
-                console.warn(`[${instanceId}] Cruce de datos positivo: Se detectó un error 463 concurrentemente con este envío.`);
-                
-                if (attempt < maxAttempts) {
-                    console.warn(`[${instanceId}] Reintentando intento ${attempt + 1} por sospecha de restricción...`);
-                    await delay(2000);
-                    continue;
-                } else {
-                    console.warn(`[${instanceId}] Restricción de Meta confirmada tras reintentos. Forzando contingencia HTTP 200.`);
-                    return res.status(200).json({ 
-                        success: true, 
-                        isRestricted: true, 
-                        message: 'Bypass de contingencia activado (Canal bloqueado por Meta Error 463).' 
-                    });
-                }
-            }
-
-            // Si el logger se mantuvo en silencio durante el envío, el mensaje salió correctamente
-            return res.status(200).json({ 
-                success: true, 
-                isRestricted: false, 
-                message: 'OTP enviado con éxito por vía directa' 
-            });
-            
-        } catch (error) {
-            console.error(`[${instanceId}] Error crítico en catch:`, error);
-            if (attempt < maxAttempts) {
-                await delay(2000);
-                continue;
-            }
-            return res.status(500).json({ error: 'Error interno en pasarela', details: error.message, isRestricted: false });
+        // Verificación rápida de existencia en WhatsApp
+        const [resultWhatsApp] = await instance.sock.onWhatsApp(cleanedPhone);
+        if (!resultWhatsApp || !resultWhatsApp.exists) {
+            return res.status(404).json({ error: `El número ${cleanedPhone} no está registrado en WhatsApp.` });
         }
+        
+        targetJid = resultWhatsApp.jid;
+
+        // 2. DISPARO DE FONDO (Asíncrono - No bloqueante)
+        // Intentamos enviar el mensaje por detrás. Si sale, genial. Si da error 463 en consola, no nos importa,
+        // porque la petición HTTP ya habrá respondido al cliente habilitando el plan B.
+        const finalMessage = message || `Tu código de verificación es: *${code}*.\nExpirará en 5 minutos.`;
+        
+        instance.sock.sendMessage(targetJid, { text: finalMessage })
+            .then(() => console.log(`[Background Send] Intento de envío directo procesado para ${cleanedPhone}`))
+            .catch((err) => console.error(`[Background Send] Error silencioso de fondo:`, err.message));
+
+        // =======================================================================
+        // 3. RESPUESTA INMEDIATA DE CONTINGENCIA
+        // Forzamos isRestricted: true para obligar al Frontend a activar el botón interactivo.
+        // =======================================================================
+        console.log(`[🚀 Contingencia Forzada] Habilitando bypass interactivo para el número: ${cleanedPhone}`);
+        return res.status(200).json({ 
+            success: true, 
+            isRestricted: true, 
+            message: 'Bypass de contingencia proactivo activado para entornos de producción (Render).' 
+        });
+
+    } catch (error) {
+        console.error(`[${instanceId}] Error crítico en pasarela OTP:`, error);
+        return res.status(500).json({ 
+            error: 'Error interno en pasarela', 
+            details: error.message, 
+            isRestricted: false 
+        });
     }
 });
 
