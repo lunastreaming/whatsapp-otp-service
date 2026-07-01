@@ -144,6 +144,7 @@ app.get('/instance/qr/:instanceId', (req, res) => {
 });
 
 // 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO)
+// 3. Enviar OTP seleccionando la instancia (CON ANCLAJE DE MEMORIA Y AUTO-REINTENTO CORREGIDO)
 app.post('/instance/send-otp', async (req, res) => {
     const { instanceId, phone, code, message } = req.body;
 
@@ -196,25 +197,45 @@ app.post('/instance/send-otp', async (req, res) => {
 
             await instance.sock.sendMessage(targetJid, { text: finalMessage });
             
-            return res.status(200).json({ success: true, message: 'OTP enviado con éxito por vía directa' });
+            // Si el mensaje se envía con éxito, retornamos isRestricted: false
+            return res.status(200).json({ 
+                success: true, 
+                isRestricted: false, 
+                message: 'OTP enviado con éxito por vía directa' 
+            });
             
         } catch (error) {
             console.error(`[${instanceId}] Error en intento ${attempt} al enviar OTP:`, error);
 
             const errorMessage = error.message || '';
             const rawErrorData = error.jsonData || JSON.stringify(error);
-            const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463');
+            
+            // Detección estricta del error 463 de Meta
+            const isRestricted = errorMessage.includes('463') || rawErrorData.includes('463') || errorMessage.includes('restricted');
 
-            if (isRestricted && attempt < maxAttempts) {
-                console.warn(`[${instanceId}] Detectado error 463. Esperando 3 segundos antes del reintento...`);
-                await delay(3000);
-                continue; 
+            if (isRestricted) {
+                if (attempt < maxAttempts) {
+                    console.warn(`[${instanceId}] Detectado error 463 en intento ${attempt}. Esperando 3 segundos antes del reintento...`);
+                    await delay(3000);
+                    continue; // Ejecuta el intento 2
+                } else {
+                    // 🚨 AQUÍ ESTÁ EL CAMBIO CLAVE: Si ya agotó los intentos y sigue dando 463, 
+                    // devolvemos un HTTP 200 con isRestricted: true. De esta manera, Spring Boot 
+                    // sabrá que no es un error del servidor, sino un bypass controlado que debe dejar pasar.
+                    console.warn(`[${instanceId}] Error 463 persistente tras ${attempt} intentos. Activando bypass de contingencia.`);
+                    return res.status(200).json({ 
+                        success: true, 
+                        isRestricted: true, 
+                        message: 'Bypass de contingencia activado por restricciones del canal directo (Meta Error 463).' 
+                    });
+                }
             }
 
+            // Si es cualquier otro error que no sea el 463 (ej. caída de red), devolvemos HTTP 500
             return res.status(500).json({ 
                 error: 'Error al enviar el mensaje de verificación', 
                 details: errorMessage,
-                isRestricted: isRestricted 
+                isRestricted: false 
             });
         }
     }
